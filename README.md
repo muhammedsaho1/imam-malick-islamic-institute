@@ -1,1 +1,1 @@
-# imam-malick-islamic-institute
+IMAM
