@@ -58,7 +58,7 @@
 //  - Nothing is deleted: removed slides are kept (can be restored), news posts
 //    can only be hidden, and EVERY create/edit/hide is saved in news_history.
 
-import { neon } from '@neondatabase/serverless';
+import { neon, Client } from '@neondatabase/serverless';
 import crypto from 'node:crypto';
 
 // ---------------------------------------------------------------------------
@@ -85,6 +85,26 @@ function getDb() {
     throw new Error('DATABASE_URL environment variable is not set');
   }
   return neon(process.env.DATABASE_URL);
+}
+
+// Big jobs (the database update, init-db) can need hundreds of queries.
+// Cloudflare's free plan allows only 50 network calls per request, and every
+// normal query is one call. So where WebSockets exist (Cloudflare) these jobs
+// run over ONE database connection instead, which counts as a single call.
+// Elsewhere (Netlify) they use the normal query function as before.
+async function withBigJobDb(fn) {
+  if (typeof WebSocket === 'undefined' || !process.env.DATABASE_URL) return fn(getDb());
+  const client = new Client(process.env.DATABASE_URL);
+  await client.connect();
+  const sql = (strings, ...vals) => {
+    let text, params;
+    if (Array.isArray(strings) && strings.raw) {
+      text = strings[0]; params = [];
+      for (let i = 0; i < vals.length; i++) { params.push(vals[i]); text += '$' + params.length + strings[i + 1]; }
+    } else { text = strings; params = vals[0] || []; }
+    return client.query(text, params).then(r => r.rows);
+  };
+  try { return await fn(sql); } finally { try { await client.end(); } catch (e) {} }
 }
 
 function getRoute(event) {
@@ -3108,21 +3128,27 @@ async function migrate(sql) {
       WHERE e.student_id = p.student_id AND e.academic_year = p.academic_year AND p.grade_level IS NULL
     `;
     await sql`CREATE INDEX IF NOT EXISTS idx_fee_payments_student ON fee_payments(student_id, academic_year, term)`;
-    // Receipts: who paid, edit tracking, and the sequential receipt number counter.
+    await migrateReceipts(sql);
+}
+
+// Receipts: who paid, edit tracking, and the sequential receipt number counter.
+// Kept separate and small (about 5 queries) so it can run on its own on hosts
+// that limit how many database calls one request may make (Cloudflare free: 50).
+async function migrateReceipts(sql) {
+  await sql`
+    ALTER TABLE fee_payments
+      ADD COLUMN IF NOT EXISTS paid_by   TEXT,
+      ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS edited_by TEXT
+  `;
+  if (!(await sql`SELECT to_regclass('public.receipt_no_seq') IS NOT NULL AS ok`)[0].ok) {
+    await sql`CREATE SEQUENCE IF NOT EXISTS receipt_no_seq`;
+    // Start after the highest numeric receipt number already used.
     await sql`
-      ALTER TABLE fee_payments
-        ADD COLUMN IF NOT EXISTS paid_by   TEXT,
-        ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ,
-        ADD COLUMN IF NOT EXISTS edited_by TEXT
+      SELECT setval('receipt_no_seq', GREATEST(m.n, 1), m.n > 0)
+      FROM (SELECT COALESCE(MAX(CASE WHEN receipt_no ~ '^[0-9]+$' THEN receipt_no::bigint END), 0) AS n FROM fee_payments) m
     `;
-    if (!(await sql`SELECT to_regclass('public.receipt_no_seq') IS NOT NULL AS ok`)[0].ok) {
-      await sql`CREATE SEQUENCE IF NOT EXISTS receipt_no_seq`;
-      // Start after the highest numeric receipt number already used.
-      await sql`
-        SELECT setval('receipt_no_seq', GREATEST(m.n, 1), m.n > 0)
-        FROM (SELECT COALESCE(MAX(CASE WHEN receipt_no ~ '^[0-9]+$' THEN receipt_no::bigint END), 0) AS n FROM fee_payments) m
-      `;
-    }
+  }
 
 }
 
@@ -3151,14 +3177,17 @@ async function ensureSchema(sql) {
       AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'students' AND column_name = 'repeat_next')
       AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'results' AND column_name = 'entered_by')
       AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'fee_payments' AND column_name = 'voided')
-      AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'fee_payments' AND column_name = 'paid_by')
-      AND to_regclass('public.receipt_no_seq') IS NOT NULL
       AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'activity_log' AND column_name = 'location')
-      AS ok
+      AS ok,
+      (EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'fee_payments' AND column_name = 'paid_by')
+       AND to_regclass('public.receipt_no_seq') IS NOT NULL) AS receipts_ok
   `;
   if (!r[0].ok) {
     console.log('Database is missing new tables/columns — updating it automatically...');
-    await migrate(sql);
+    await withBigJobDb(migrate);
+  } else if (!r[0].receipts_ok) {
+    console.log('Adding receipt columns...');
+    await migrateReceipts(sql);
   }
   schemaReady = true;
 }
@@ -3173,6 +3202,14 @@ async function initDb(sql, event) {
     return json({ error: 'Forbidden' }, 403);
   }
   try {
+    return await withBigJobDb((sql) => initDbRun(sql));
+  } catch (err) {
+    console.error('init-db error:', err);
+    return json({ success: false, error: err.message }, 500);
+  }
+}
+async function initDbRun(sql) {
+  {
     await migrate(sql);
 
     // ---- Upgrade plain-text passwords to hashes ----
@@ -3195,9 +3232,6 @@ async function initDb(sql, event) {
         : 'Database ready! All passwords are hashed.',
       remainingPlainPasswords: remaining,
     });
-  } catch (err) {
-    console.error('init-db error:', err);
-    return json({ success: false, error: err.message }, 500);
   }
 }
 
