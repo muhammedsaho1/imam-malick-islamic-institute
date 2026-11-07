@@ -1,7 +1,7 @@
 {
   "name": "IMAM",
   "short_name": "IMAM",
-  "description": "Admin panel — Imam Malick Conventional Upper Basic School",
+  "description": "Admin panel \u2014 Imam Malick Conventional Upper Basic School",
   "id": "/admin-xo42rqv82v/",
   "start_url": "/admin-xo42rqv82v/",
   "scope": "/admin-xo42rqv82v/",
@@ -26,6 +26,12 @@
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable"
+    }
+  ],
+  "related_applications": [
+    {
+      "platform": "webapp",
+      "url": "/admin-xo42rqv82v/manifest.webmanifest"
     }
   ]
 }

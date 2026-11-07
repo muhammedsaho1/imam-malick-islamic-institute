@@ -757,3 +757,37 @@ switchAdminTab = function (tab, btn) {
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", show); else show();
 })();
+
+/* ===================================================================
+ * INSTALL BANNER — ask the device itself whether the IMAM app is
+ * installed, every time the admin page opens or gets focus:
+ *  - installed on this computer  -> banner hidden
+ *  - never installed / uninstalled later -> banner shows again
+ * (Before, a saved "installed" flag could keep it hidden for good.)
+ * =================================================================== */
+var imInstalledLive = null; // true / false once the device has answered
+function imamInstalledHere() {
+  if (imamStandalone()) return true;
+  if (imInstalledLive !== null) return imInstalledLive;
+  try { return localStorage.getItem("imamAppInstalled") === "1"; } catch (e) { return false; }
+}
+function setImamInstalled(on) {
+  imInstalledLive = !!on;
+  try { if (on) localStorage.setItem("imamAppInstalled", "1"); else localStorage.removeItem("imamAppInstalled"); } catch (e) {}
+}
+async function imCheckInstalled() {
+  if (imamStandalone()) { setImamInstalled(true); updateInstallBar(); return; }
+  if (!navigator.getInstalledRelatedApps) return; // browser can't tell: fall back to the install-prompt signal
+  try {
+    var apps = await navigator.getInstalledRelatedApps();
+    var mine = (apps || []).some(function (a) { return a.platform === "webapp"; });
+    setImamInstalled(mine);
+    updateInstallBar();
+  } catch (e) {}
+}
+window.addEventListener("beforeinstallprompt", function () { imInstalledLive = false; });
+window.addEventListener("appinstalled", function () { setImamInstalled(true); updateInstallBar(); });
+document.addEventListener("visibilitychange", function () { if (!document.hidden) imCheckInstalled(); });
+window.addEventListener("focus", imCheckInstalled);
+setTimeout(imCheckInstalled, 300);
+setTimeout(imCheckInstalled, 7000); // after the old 6-second guess, so the real answer wins
